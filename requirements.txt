@@ -2,3 +2,5 @@ python-telegram-bot[webhooks]==20.5
 pandas
 openpyxl
 reportlab
+jdatetime
+tzdata
