@@ -5,30 +5,50 @@ import sqlite3
 from datetime import datetime, timedelta, date
 import io
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
-)
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters
-)
+import jdatetime
 import pandas as pd
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
 
 # ---------- CONFIG ----------
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data.db"
 
-LOCATIONS = ["شعبه ۱", "شعبه ۲", "شعبه ۳", "انبار ۱", "انبار ۲", "دفتر شهرک"]
+TEHRAN_TZ = ZoneInfo("Asia/Tehran")
+
+LOCATIONS = [
+    "گلشهر",
+    "کوچمشکی",
+    "جاده شهرک",
+    "انبار صفا",
+    "انبار پونک",
+    "دفتر شهرک",
+]
 # ----------------------------
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- DB helpers ---
+# ---------- DB helpers ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -78,42 +98,92 @@ def db_execute(query, params=(), fetch=False):
     conn.close()
 
 
-# --- Utility ---
+# ---------- زمان: تهران + شمسی ----------
+def now_dt():
+    return datetime.now(TEHRAN_TZ)
+
+
 def now_iso():
-    return datetime.now().isoformat(timespec="seconds")
+    # ذخیره در دیتابیس (میلادی با تایم‌زون تهران)
+    return now_dt().isoformat(timespec="seconds")
 
 
 def today_str():
-    return date.today().isoformat()
+    # تاریخ امروز (میلادی) برای دیتابیس
+    return now_dt().date().isoformat()
 
 
 def time_str():
-    return datetime.now().strftime("%H:%M:%S")
+    # ساعت فعلی تهران برای نمایش
+    return now_dt().strftime("%H:%M:%S")
 
 
-# --- Start ---
+def gregorian_date_to_jalali_str(d: date) -> str:
+    j = jdatetime.date.fromgregorian(date=d)
+    return f"{j.year:04d}-{j.month:02d}-{j.day:02d}"
+
+
+def iso_to_jalali_str(iso_str: str) -> str:
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TEHRAN_TZ)
+    else:
+        dt = dt.astimezone(TEHRAN_TZ)
+    j = jdatetime.datetime.fromgregorian(datetime=dt)
+    return f"{j.year:04d}-{j.month:02d}-{j.day:02d} {dt.strftime('%H:%M:%S')}"
+
+
+def parse_jalali_date(s: str) -> date:
+    """ورودی مثل 1403-01-15 (جلالی) → خروجی date میلادی"""
+    j = jdatetime.date.fromisoformat(s)
+    g = j.togregorian()
+    return g
+
+
+# ---------- کیبورد اصلی ----------
+def build_main_keyboard():
+    rows = []
+    row = []
+    for loc in LOCATIONS:
+        row.append(KeyboardButton(loc))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([KeyboardButton("گزارش‌ها"), KeyboardButton("یادداشت روزانه")])
+    rows.append([KeyboardButton("بازگشت"), KeyboardButton("شروع مجدد")])
+
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def reset_user_state(user_id: int):
+    # فعلاً فقط حالت یادداشت را خاموش می‌کنیم
+    db_execute(
+        "INSERT OR REPLACE INTO note_sessions(user_id, active) VALUES (?,0)",
+        (user_id,),
+    )
+
+
+# ---------- /start ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # save user
     db_execute(
         "INSERT OR REPLACE INTO users(user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
         (user.id, user.username or "", user.first_name or "", user.last_name or ""),
     )
-    keyboard = [[KeyboardButton(loc)] for loc in LOCATIONS]
-    keyboard.append([KeyboardButton("گزارش‌ها"), KeyboardButton("یادداشت روزانه")])
-    reply = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     if update.message:
         await update.message.reply_text(
             "سلام! لوکیشن خود را انتخاب کن یا یکی از دکمه‌ها را بزن:",
-            reply_markup=reply,
+            reply_markup=build_main_keyboard(),
         )
 
 
-# --- core actions: entry / exit ---
+# ---------- حضور: ورود / خروج ----------
 async def handle_entry(query, context, location: str):
     user = query.from_user
     ts = now_iso()
-    # Check last attendance for same user+location with NULL exit_time
     rows = db_execute(
         "SELECT id, entry_time FROM attendance "
         "WHERE user_id=? AND location=? AND exit_time IS NULL "
@@ -132,7 +202,8 @@ async def handle_entry(query, context, location: str):
         "VALUES (?, ?, ?, NULL, 0)",
         (user.id, location, ts),
     )
-    await query.message.reply_text(f"✅ ورود به {location} در {ts} ثبت شد.")
+    jalali_ts = iso_to_jalali_str(ts)
+    await query.message.reply_text(f"✅ ورود به {location} در {jalali_ts} ثبت شد.")
 
 
 async def handle_exit(query, context, location: str):
@@ -148,20 +219,20 @@ async def handle_exit(query, context, location: str):
     if rows:
         rid, entry_time = rows[0]
         db_execute("UPDATE attendance SET exit_time=? WHERE id=?", (ts, rid))
-        # compute duration
         try:
-            start = datetime.fromisoformat(entry_time)
-            end = datetime.fromisoformat(ts)
-            delta = end - start
+            start_dt = datetime.fromisoformat(entry_time)
+            end_dt = datetime.fromisoformat(ts)
+            delta = end_dt - start_dt
             human = str(delta).split(".")[0]
         except Exception:
             human = "—"
+        jalali_ts = iso_to_jalali_str(ts)
         await query.message.reply_text(
-            f"✅ خروج از {location} در {ts} ثبت شد.\n"
-            f"مدت زمان این بازه: {human}"
+            f"✅ خروج از {location} در {jalali_ts} ثبت شد.\n"
+            f"مدت زمان این بازه: {human}",
+            reply_markup=build_main_keyboard(),
         )
     else:
-        # no open entry -> ask to auto-create
         kb = [
             [
                 InlineKeyboardButton(
@@ -169,7 +240,10 @@ async def handle_exit(query, context, location: str):
                     callback_data=f"confirm:auto_entry|{user.id}|{location}",
                 )
             ],
-            [InlineKeyboardButton("لغو", callback_data="action:back")],
+            [
+                InlineKeyboardButton("بازگشت", callback_data="action:back"),
+                InlineKeyboardButton("شروع مجدد", callback_data="action:restart"),
+            ],
         ]
         await query.message.reply_text(
             "برای این لوکیشن ورود ثبت نشده است. "
@@ -185,12 +259,14 @@ async def confirm_auto_entry(query, context, user_id: int, location: str):
         "VALUES (?, ?, ?, ?, 1)",
         (user_id, location, ts, ts),
     )
+    jalali_ts = iso_to_jalali_str(ts)
     await query.message.reply_text(
-        f"ورود و خروج خودکار برای {location} در {ts} ثبت شد (auto_created)."
+        f"ورود و خروج خودکار برای {location} در {jalali_ts} ثبت شد (auto_created).",
+        reply_markup=build_main_keyboard(),
     )
 
 
-# --- Notes session start/stop ---
+# ---------- یادداشت روزانه ----------
 async def start_note_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db_execute(
@@ -198,8 +274,9 @@ async def start_note_session(update: Update, context: ContextTypes.DEFAULT_TYPE)
         (user.id,),
     )
     kb = [
-        [KeyboardButton("پایان یادداشت")],
-        [KeyboardButton("گزارش یادداشت روز")],
+        [KeyboardButton("پایان یادداشت"), KeyboardButton("گزارش یادداشت روزانه")],
+        [KeyboardButton("گزارش یادداشت هفتگی"), KeyboardButton("گزارش یادداشت ماهانه")],
+        [KeyboardButton("بازگشت"), KeyboardButton("شروع مجدد")],
     ]
     await update.message.reply_text(
         "حالت یادداشت فعال شد — هر پیامی که الان ارسال کنی "
@@ -217,12 +294,11 @@ async def end_note_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         "حالت یادداشت غیرفعال شد.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=build_main_keyboard(),
     )
 
 
 async def handle_note_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """اگر حالت یادداشت فعال باشد، متن را به عنوان یادداشت ذخیره می‌کند."""
     user = update.effective_user
     rows = db_execute(
         "SELECT active FROM note_sessions WHERE user_id=?",
@@ -240,22 +316,12 @@ async def handle_note_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("یادداشت ذخیره شد.")
     else:
         await update.message.reply_text(
-            "برای ذخیره یادداشت ابتدا دکمه «یادداشت روزانه» را بزن."
+            "برای ذخیره یادداشت ابتدا دکمه «یادداشت روزانه» را بزن.",
+            reply_markup=build_main_keyboard(),
         )
 
 
-# --- Reports menu ---
-async def send_report_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [KeyboardButton("گزارش روزانه"), KeyboardButton("گزارش هفتگی")],
-        [KeyboardButton("گزارش ماهانه"), KeyboardButton("خروجی Excel/PDF")],
-    ]
-    await update.message.reply_text(
-        "کدام گزارش را می‌خواهی؟",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
-    )
-
-
+# ---------- گزارش حضور ----------
 def format_duration(td: timedelta):
     total_seconds = int(td.total_seconds())
     hours = total_seconds // 3600
@@ -292,27 +358,33 @@ def calc_stats_for_period(user_id, start_date: date, end_date: date):
     return stats, total
 
 
-async def generate_text_report(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, period="daily"
-):
-    user = update.effective_user
+def get_period_dates(period: str):
+    today = now_dt().date()
     if period == "daily":
-        sd = date.today()
-        ed = sd
-        title = f"گزارش روزانه — {sd.isoformat()}"
+        sd = today
+        ed = today
     elif period == "weekly":
-        today = date.today()
         sd = today - timedelta(days=today.weekday())
         ed = sd + timedelta(days=6)
-        title = f"گزارش هفتگی — {sd.isoformat()} تا {ed.isoformat()}"
-    else:
-        today = date.today()
+    elif period == "monthly":
         sd = today.replace(day=1)
         if sd.month == 12:
             ed = sd.replace(year=sd.year + 1, month=1, day=1) - timedelta(days=1)
         else:
             ed = sd.replace(month=sd.month + 1, day=1) - timedelta(days=1)
-        title = f"گزارش ماهانه — {sd.isoformat()} تا {ed.isoformat()}"
+    else:
+        raise ValueError("invalid period")
+    return sd, ed
+
+
+async def generate_text_report(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, period="daily", sd=None, ed=None
+):
+    user = update.effective_user
+    if sd is None or ed is None:
+        sd, ed = get_period_dates(period)
+
+    title = f"گزارش حضور — {gregorian_date_to_jalali_str(sd)} تا {gregorian_date_to_jalali_str(ed)}"
 
     stats, total = calc_stats_for_period(user.id, sd, ed)
     lines = [title, ""]
@@ -321,38 +393,74 @@ async def generate_text_report(
         lines.append(f"• {loc}: {format_duration(loc_total)}")
         intervals = stats.get(loc, {}).get("intervals", [])
         for ent, ex, dur in intervals:
+            ent_local = ent.astimezone(TEHRAN_TZ)
+            ex_local = ex.astimezone(TEHRAN_TZ)
             lines.append(
-                f"    {ent.strftime('%H:%M:%S')} → "
-                f"{ex.strftime('%H:%M:%S')} = {format_duration(dur)}"
+                f"    {ent_local.strftime('%H:%M:%S')} → "
+                f"{ex_local.strftime('%H:%M:%S')} = {format_duration(dur)}"
             )
     lines.append("")
     lines.append(f"⏱ مجموع کل حضور در بازه: {format_duration(total)}")
     await update.message.reply_text(
-        "\n".join(lines), reply_markup=ReplyKeyboardRemove()
+        "\n".join(lines),
+        reply_markup=build_main_keyboard(),
     )
 
 
+# ---------- گزارش یادداشت‌ها در بازه ----------
+def collect_notes_for_period(user_id: int, sd: date, ed: date):
+    s = sd.isoformat()
+    e = ed.isoformat()
+    rows = db_execute(
+        "SELECT note_date, time, message FROM daily_notes "
+        "WHERE user_id=? AND note_date>=? AND note_date<=? "
+        "ORDER BY note_date, time, id",
+        (user_id, s, e),
+        fetch=True,
+    )
+    return rows
+
+
+async def generate_notes_report(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    period="daily",
+    sd=None,
+    ed=None,
+):
+    user = update.effective_user
+    if sd is None or ed is None:
+        sd, ed = get_period_dates(period)
+
+    rows = collect_notes_for_period(user.id, sd, ed)
+    if not rows:
+        await update.message.reply_text(
+            "در این بازه هیچ یادداشتی ثبت نشده است.",
+            reply_markup=build_main_keyboard(),
+        )
+        return
+
+    title = f"گزارش یادداشت‌ها — {gregorian_date_to_jalali_str(sd)} تا {gregorian_date_to_jalali_str(ed)}"
+    lines = [title, ""]
+    current_date = None
+    for note_date_str, t, msg in rows:
+        d = date.fromisoformat(note_date_str)
+        if current_date != note_date_str:
+            current_date = note_date_str
+            lines.append(f"📅 {gregorian_date_to_jalali_str(d)}:")
+        lines.append(f"  {t} — {msg}")
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=build_main_keyboard(),
+    )
+
+
+# ---------- گزارش Excel / PDF (برای حضور) ----------
 async def generate_excel_report(
     update: Update, context: ContextTypes.DEFAULT_TYPE, period="daily"
 ):
     user = update.effective_user
-    if period == "daily":
-        sd = date.today()
-        ed = sd
-        fname = f"report_daily_{sd.isoformat()}.xlsx"
-    elif period == "weekly":
-        today = date.today()
-        sd = today - timedelta(days=today.weekday())
-        ed = sd + timedelta(days=6)
-        fname = f"report_weekly_{sd.isoformat()}_to_{ed.isoformat()}.xlsx"
-    else:
-        today = date.today()
-        sd = today.replace(day=1)
-        if sd.month == 12:
-            ed = sd.replace(year=sd.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            ed = sd.replace(month=sd.month + 1, day=1) - timedelta(days=1)
-        fname = f"report_monthly_{sd.isoformat()}_to_{ed.isoformat()}.xlsx"
+    sd, ed = get_period_dates(period)
 
     s = sd.isoformat()
     e = (ed + timedelta(days=1)).isoformat()
@@ -381,6 +489,14 @@ async def generate_excel_report(
     else:
         df = pd.DataFrame(columns=["location", "entry_time", "exit_time", "hours"])
 
+    # اسم فایل میلادی باشه، ایرادی نداره
+    if period == "daily":
+        fname = f"attendance_daily_{sd.isoformat()}.xlsx"
+    elif period == "weekly":
+        fname = f"attendance_weekly_{sd.isoformat()}_to_{ed.isoformat()}.xlsx"
+    else:
+        fname = f"attendance_monthly_{sd.isoformat()}_to_{ed.isoformat()}.xlsx"
+
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="attendance")
@@ -392,30 +508,12 @@ async def generate_pdf_report(
     update: Update, context: ContextTypes.DEFAULT_TYPE, period="daily"
 ):
     user = update.effective_user
-    if period == "daily":
-        sd = date.today()
-        ed = sd
-        title = f"گزارش روزانه — {sd.isoformat()}"
-        fname = f"report_daily_{sd.isoformat()}.pdf"
-    elif period == "weekly":
-        today = date.today()
-        sd = today - timedelta(days=today.weekday())
-        ed = sd + timedelta(days=6)
-        title = f"گزارش هفتگی — {sd.isoformat()} تا {ed.isoformat()}"
-        fname = f"report_weekly_{sd.isoformat()}_to_{ed.isoformat()}.pdf"
-    else:
-        today = date.today()
-        sd = today.replace(day=1)
-        if sd.month == 12:
-            ed = sd.replace(year=sd.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            ed = sd.replace(month=sd.month + 1, day=1) - timedelta(days=1)
-        title = f"گزارش ماهانه — {sd.isoformat()} تا {ed.isoformat()}"
-        fname = f"report_monthly_{sd.isoformat()}_to_{ed.isoformat()}.pdf"
+    sd, ed = get_period_dates(period)
+    title = f"گزارش حضور — {gregorian_date_to_jalali_str(sd)} تا {gregorian_date_to_jalali_str(ed)}"
 
     stats, total = calc_stats_for_period(user.id, sd, ed)
     bio = io.BytesIO()
-    c = canvas.Canvas(bio, pagesizes=A4)
+    c = canvas.Canvas(bio, pagesize=A4)
     w, h = A4
     y = h - 50
     c.setFont("Helvetica-Bold", 14)
@@ -429,40 +527,100 @@ async def generate_pdf_report(
         y -= 18
         intervals = stats.get(loc, {}).get("intervals", [])
         for ent, ex, dur in intervals:
+            ent_local = ent.astimezone(TEHRAN_TZ)
+            ex_local = ex.astimezone(TEHRAN_TZ)
             sline = (
-                f"   {ent.strftime('%H:%M:%S')} -> "
-                f"{ex.strftime('%H:%M:%S')} = {format_duration(dur)}"
+                f"   {ent_local.strftime('%H:%M:%S')} -> "
+                f"{ex_local.strftime('%H:%M:%S')} = {format_duration(dur)}"
             )
             c.drawString(70, y, sline)
             y -= 14
             if y < 80:
                 c.showPage()
                 y = h - 50
+                c.setFont("Helvetica", 11)
     c.drawString(50, y - 10, f"مجموع کل: {format_duration(total)}")
     c.save()
     bio.seek(0)
+
+    if period == "daily":
+        fname = f"attendance_daily_{sd.isoformat()}.pdf"
+    elif period == "weekly":
+        fname = f"attendance_weekly_{sd.isoformat()}_to_{ed.isoformat()}.pdf"
+    else:
+        fname = f"attendance_monthly_{sd.isoformat()}_to_{ed.isoformat()}.pdf"
+
     await update.message.reply_document(document=bio, filename=fname)
 
 
-async def send_daily_notes_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- گزارش بازه دلخواه (حضور و یادداشت) ----------
+async def report_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /report_range 1403-01-01 1403-01-10
+    بازه تاریخ جلالی، هم گزارش حضور تولید می‌کنه هم مجموع.
+    """
     user = update.effective_user
-    d = today_str()
-    rows = db_execute(
-        "SELECT time, message FROM daily_notes "
-        "WHERE user_id=? AND note_date=? ORDER BY id",
-        (user.id, d),
-        fetch=True,
-    )
-    if not rows:
-        await update.message.reply_text("هیچ یادداشتی برای امروز ثبت نشده است.")
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "فرمت استفاده:\n"
+            "/report_range 1403-01-01 1403-01-10",
+            reply_markup=build_main_keyboard(),
+        )
         return
-    lines = [f"گزارش یادداشت‌های روز — {d}", ""]
-    for t, m in rows:
-        lines.append(f"{t} — {m}")
-    await update.message.reply_text("\n".join(lines))
+    try:
+        sd_g = parse_jalali_date(context.args[0])
+        ed_g = parse_jalali_date(context.args[1])
+    except Exception:
+        await update.message.reply_text(
+            "تاریخ‌ها نامعتبرند. فرمت صحیح: 1403-01-01",
+            reply_markup=build_main_keyboard(),
+        )
+        return
+
+    await generate_text_report(update, context, sd=sd_g, ed=ed_g)
 
 
-# --- Quick text handler (reports, exports, notes) ---
+async def notes_range_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /notes_range 1403-01-01 1403-01-10
+    گزارش یادداشت‌ها در بازه دلخواه (جلالی).
+    """
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "فرمت استفاده:\n"
+            "/notes_range 1403-01-01 1403-01-10",
+            reply_markup=build_main_keyboard(),
+        )
+        return
+    try:
+        sd_g = parse_jalali_date(context.args[0])
+        ed_g = parse_jalali_date(context.args[1])
+    except Exception:
+        await update.message.reply_text(
+            "تاریخ‌ها نامعتبرند. فرمت صحیح: 1403-01-01",
+            reply_markup=build_main_keyboard(),
+        )
+        return
+
+    await generate_notes_report(update, context, sd=sd_g, ed=ed_g)
+
+
+# ---------- منو گزارش‌ها ----------
+async def send_report_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [
+        [KeyboardButton("گزارش روزانه"), KeyboardButton("گزارش هفتگی")],
+        [KeyboardButton("گزارش ماهانه"), KeyboardButton("خروجی Excel/PDF")],
+        [KeyboardButton("گزارش یادداشت روزانه"), KeyboardButton("گزارش یادداشت هفتگی")],
+        [KeyboardButton("گزارش یادداشت ماهانه")],
+        [KeyboardButton("بازگشت"), KeyboardButton("شروع مجدد")],
+    ]
+    await update.message.reply_text(
+        "کدام گزارش را می‌خواهی؟",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
+    )
+
+
+# ---------- هندل متن‌ها (روتر مرکزی) ----------
 async def handle_quick_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     if text == "گزارش روزانه":
         await generate_text_report(update, context, period="daily")
@@ -474,7 +632,8 @@ async def handle_quick_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         kb = [
             [KeyboardButton("Excel روزانه"), KeyboardButton("PDF روزانه")],
             [KeyboardButton("Excel هفتگی"), KeyboardButton("PDF هفتگی")],
-            [KeyboardButton("بازگشت")],
+            [KeyboardButton("Excel ماهانه"), KeyboardButton("PDF ماهانه")],
+            [KeyboardButton("بازگشت"), KeyboardButton("شروع مجدد")],
         ]
         await update.message.reply_text(
             "فرمت گزارش را انتخاب کن:",
@@ -488,28 +647,45 @@ async def handle_quick_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await generate_excel_report(update, context, period="weekly")
     elif text == "PDF هفتگی":
         await generate_pdf_report(update, context, period="weekly")
-    elif text == "گزارش یادداشت روز":
-        await send_daily_notes_report(update, context)
+    elif text == "Excel ماهانه":
+        await generate_excel_report(update, context, period="monthly")
+    elif text == "PDF ماهانه":
+        await generate_pdf_report(update, context, period="monthly")
+    elif text == "گزارش یادداشت روزانه":
+        await generate_notes_report(update, context, period="daily")
+    elif text == "گزارش یادداشت هفتگی":
+        await generate_notes_report(update, context, period="weekly")
+    elif text == "گزارش یادداشت ماهانه":
+        await generate_notes_report(update, context, period="monthly")
     elif text == "پایان یادداشت":
         await end_note_session(update, context)
     elif text == "بازگشت":
-        # برگشت به منوی اصلی
-        keyboard = [[KeyboardButton(loc)] for loc in LOCATIONS]
-        keyboard.append([KeyboardButton("گزارش‌ها"), KeyboardButton("یادداشت روزانه")])
-        reply = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text("بازگشت به منوی اصلی.", reply_markup=reply)
+        await update.message.reply_text(
+            "بازگشت به منوی اصلی.",
+            reply_markup=build_main_keyboard(),
+        )
+    elif text == "شروع مجدد":
+        reset_user_state(update.effective_user.id)
+        await update.message.reply_text(
+            "همه‌چیز از نو شروع شد.",
+            reply_markup=build_main_keyboard(),
+        )
 
 
-# --- text router ---
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
-    # 1) اگر یکی از لوکیشن‌ها بود → inline دکمه ورود/خروج
+    # 1) لوکیشن‌ها → دکمه‌های ورود/خروج
     if text in LOCATIONS:
         kb = [
-            [InlineKeyboardButton("ورود", callback_data=f"action:entry|{text}")],
-            [InlineKeyboardButton("خروج", callback_data=f"action:exit|{text}")],
-            [InlineKeyboardButton("بازگشت", callback_data="action:back")],
+            [
+                InlineKeyboardButton("ورود", callback_data=f"action:entry|{text}"),
+                InlineKeyboardButton("خروج", callback_data=f"action:exit|{text}"),
+            ],
+            [
+                InlineKeyboardButton("بازگشت", callback_data="action:back"),
+                InlineKeyboardButton("شروع مجدد", callback_data="action:restart"),
+            ],
         ]
         await update.message.reply_text(
             f"لوکیشن: {text}\nعملیات مورد نظر را انتخاب کن:",
@@ -517,7 +693,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 2) دکمه‌های منو
+    # 2) دکمه‌های منو اصلی
     if text == "گزارش‌ها":
         await send_report_menu(update, context)
         return
@@ -525,7 +701,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_note_session(update, context)
         return
 
-    # 3) دکمه‌های گزارش/Excel/PDF/پایان یادداشت/گزارش یادداشت
+    # 3) دکمه‌های گزارش / Excel / PDF / یادداشت / پایان / بازگشت / شروع مجدد
     quick_buttons = {
         "گزارش روزانه",
         "گزارش هفتگی",
@@ -535,19 +711,24 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "PDF روزانه",
         "Excel هفتگی",
         "PDF هفتگی",
-        "گزارش یادداشت روز",
+        "Excel ماهانه",
+        "PDF ماهانه",
+        "گزارش یادداشت روزانه",
+        "گزارش یادداشت هفتگی",
+        "گزارش یادداشت ماهانه",
         "پایان یادداشت",
         "بازگشت",
+        "شروع مجدد",
     }
     if text in quick_buttons:
         await handle_quick_text(update, context, text)
         return
 
-    # 4) هر متن دیگر → اگر حالت یادداشت فعاله به عنوان note ذخیره می‌شود
+    # 4) هر متن دیگر → اگر حالت یادداشت فعال است، به‌عنوان یادداشت ذخیره شود
     await handle_note_message(update, context)
 
 
-# --- Callback queries ---
+# ---------- Callback queries ----------
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -564,10 +745,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_exit(query, context, location)
 
     elif data == "action:back":
-        keyboard = [[KeyboardButton(loc)] for loc in LOCATIONS]
-        keyboard.append([KeyboardButton("گزارش‌ها"), KeyboardButton("یادداشت روزانه")])
-        reply = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await query.message.reply_text("بازگشت به منو اصلی:", reply_markup=reply)
+        await query.message.reply_text(
+            "بازگشت به منوی اصلی:",
+            reply_markup=build_main_keyboard(),
+        )
+
+    elif data == "action:restart":
+        reset_user_state(query.from_user.id)
+        await query.message.reply_text(
+            "همه‌چیز از نو شروع شد.",
+            reply_markup=build_main_keyboard(),
+        )
 
     elif data.startswith("confirm:auto_entry"):
         # data: confirm:auto_entry|user_id|location
@@ -579,7 +767,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await confirm_auto_entry(query, context, user_id, location)
 
 
-# --- main for Koyeb / local ---
+# ---------- main (Koyeb / local) ----------
 def main():
     init_db()
 
@@ -590,6 +778,8 @@ def main():
     app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("report_range", report_range_cmd))
+    app.add_handler(CommandHandler("notes_range", notes_range_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
